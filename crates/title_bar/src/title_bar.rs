@@ -13,6 +13,10 @@ use crate::application_menu::{
     ActivateDirection, ActivateMenuLeft, ActivateMenuRight, OpenApplicationMenu,
 };
 
+//For settings related to the Title Bar (like hiding Sign in button)
+use anyhow::Result;
+use settings::{Settings, SettingsSources};
+
 use crate::platforms::{platform_linux, platform_mac, platform_windows};
 use auto_update::AutoUpdateStatus;
 use call::ActiveCall;
@@ -58,6 +62,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    TitleBarSettings::register(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -128,6 +133,9 @@ pub struct TitleBar {
     zed_predict_banner: Entity<ZedPredictBanner>,
 }
 
+//Title bar settings
+pub struct TitleBarSettings(pub bool);
+
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let close_action = Box::new(workspace::CloseWindow);
@@ -143,6 +151,8 @@ impl Render for TitleBar {
         } else {
             cx.theme().colors().title_bar_background
         };
+        //For hiding Sign in
+        let show_signin = TitleBarSettings::get_global(cx).0;
 
         h_flex()
             .id("titlebar")
@@ -222,9 +232,14 @@ impl Render for TitleBar {
                                 if matches!(status, client::Status::Connected { .. }) {
                                     el.child(self.render_user_menu_button(cx))
                                 } else {
-                                    el.children(self.render_connection_status(status, cx))
-                                        .child(self.render_sign_in_button(cx))
-                                        .child(self.render_user_menu_button(cx))
+                                    if show_signin {
+                                        el.children(self.render_connection_status(status, cx))
+                                            .child(self.render_sign_in_button(cx))
+                                            .child(self.render_user_menu_button(cx))
+                                    } else {
+                                        el.children(self.render_connection_status(status, cx))
+                                            .child(self.render_user_menu_button(cx))
+                                    }
                                 }
                             }),
                     ),
@@ -398,6 +413,7 @@ impl TitleBar {
                             .indicator_border_color(Some(cx.theme().colors().title_bar_background))
                             .into_any_element(),
                         )
+                        .truncate()
                         .child(
                             Label::new(nickname.clone())
                                 .size(LabelSize::Small)
@@ -756,5 +772,22 @@ impl StatefulInteractiveElement for TitleBar {}
 impl ParentElement for TitleBar {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.children.extend(elements)
+    }
+}
+
+impl Settings for TitleBarSettings {
+    const KEY: Option<&'static str> = Some("titlebar_signin");
+
+    type FileContent = Option<bool>;
+
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
+        Ok(Self(
+            sources
+                .user
+                .or(sources.server)
+                .copied()
+                .flatten()
+                .unwrap_or(sources.default.ok_or_else(Self::missing_default)?),
+        ))
     }
 }
