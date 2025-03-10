@@ -38,6 +38,48 @@ actions!(
         Extensions,
         OpenLicenses,
         OpenTelemetryLog,
+    ]
+);
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct DecreaseBufferFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct IncreaseBufferFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct ResetBufferFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct DecreaseUiFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct IncreaseUiFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+pub struct ResetUiFontSize {
+    #[serde(default)]
+    pub persist: bool,
+}
+
+impl_actions!(
+    zed,
+    [
         DecreaseBufferFontSize,
         IncreaseBufferFontSize,
         ResetBufferFontSize,
@@ -72,8 +114,9 @@ pub mod workspace {
 }
 
 pub mod git {
-    use gpui::action_with_deprecated_aliases;
+    use gpui::{action_with_deprecated_aliases, actions};
 
+    actions!(git, [CheckoutBranch, Switch]);
     action_with_deprecated_aliases!(git, Branch, ["branches::OpenRecent"]);
 }
 
