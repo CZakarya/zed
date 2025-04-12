@@ -22,12 +22,12 @@ mod visual;
 use anyhow::Result;
 use collections::HashMap;
 use editor::{
+    Anchor, Bias, Editor, EditorEvent, EditorSettings, HideMouseCursorOrigin, ToPoint,
     movement::{self, FindRange},
-    Anchor, Bias, Editor, EditorEvent, EditorMode, EditorSettings, ToPoint,
 };
 use gpui::{
-    actions, impl_actions, Action, App, AppContext as _, Axis, Context, Entity, EventEmitter,
-    KeyContext, KeystrokeEvent, Render, Subscription, Task, WeakEntity, Window,
+    Action, App, AppContext, Axis, Context, Entity, EventEmitter, KeyContext, KeystrokeEvent,
+    Render, Subscription, Task, WeakEntity, Window, actions, impl_actions,
 };
 use insert::{NormalBefore, TemporaryNormal};
 use language::{CharKind, CursorShape, Point, Selection, SelectionGoal, TransactionId};
@@ -38,12 +38,12 @@ use object::Object;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_derive::Serialize;
-use settings::{update_settings_file, Settings, SettingsSources, SettingsStore};
+use settings::{Settings, SettingsSources, SettingsStore, update_settings_file};
 use state::{Mode, Operator, RecordedSelection, SearchState, VimGlobals};
 use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
 use theme::ThemeSettings;
-use ui::{px, IntoElement, SharedString};
+use ui::{IntoElement, SharedString, px};
 use vim_mode_setting::VimModeSetting;
 use workspace::{self, Pane, Workspace};
 
@@ -144,6 +144,8 @@ actions!(
         PushReplace,
         PushDeleteSurrounds,
         PushMark,
+        ToggleMarksView,
+        PushForcedMotion,
         PushIndent,
         PushOutdent,
         PushAutoIndent,
@@ -152,6 +154,8 @@ actions!(
         PushLowercase,
         PushUppercase,
         PushOppositeCase,
+        PushRot13,
+        PushRot47,
         ToggleRegistersView,
         PushRegister,
         PushRecordRegister,
@@ -230,6 +234,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &ResizePaneRight, window, cx| {
             let count = Vim::take_count(cx).unwrap_or(1) as f32;
+            Vim::take_forced_motion(cx);
             let theme = ThemeSettings::get_global(cx);
             let Ok(font_id) = window.text_system().font_id(&theme.buffer_font) else {
                 return;
@@ -245,6 +250,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &ResizePaneLeft, window, cx| {
             let count = Vim::take_count(cx).unwrap_or(1) as f32;
+            Vim::take_forced_motion(cx);
             let theme = ThemeSettings::get_global(cx);
             let Ok(font_id) = window.text_system().font_id(&theme.buffer_font) else {
                 return;
@@ -260,6 +266,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &ResizePaneUp, window, cx| {
             let count = Vim::take_count(cx).unwrap_or(1) as f32;
+            Vim::take_forced_motion(cx);
             let theme = ThemeSettings::get_global(cx);
             let height = theme.buffer_font_size(cx) * theme.buffer_line_height.value();
             workspace.resize_pane(Axis::Vertical, height * count, window, cx);
@@ -267,6 +274,7 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &ResizePaneDown, window, cx| {
             let count = Vim::take_count(cx).unwrap_or(1) as f32;
+            Vim::take_forced_motion(cx);
             let theme = ThemeSettings::get_global(cx);
             let height = theme.buffer_font_size(cx) * theme.buffer_line_height.value();
             workspace.resize_pane(Axis::Vertical, -height * count, window, cx);
@@ -314,7 +322,6 @@ pub(crate) struct Vim {
     operator_stack: Vec<Operator>,
     pub(crate) replacements: Vec<(Range<editor::Anchor>, String)>,
 
-    pub(crate) marks: HashMap<String, Vec<Anchor>>,
     pub(crate) stored_visual_mode: Option<(Mode, Vec<bool>)>,
     pub(crate) change_list: Vec<Vec<Anchor>>,
     pub(crate) change_list_position: Option<usize>,
@@ -362,7 +369,6 @@ impl Vim {
             operator_stack: Vec::new(),
             replacements: Vec::new(),
 
-            marks: HashMap::default(),
             stored_visual_mode: None,
             change_list: Vec::new(),
             change_list_position: None,
@@ -437,7 +443,7 @@ impl Vim {
 
         vim.update(cx, |_, cx| {
             Vim::action(editor, cx, |vim, _: &SwitchToNormalMode, window, cx| {
-                vim.switch_mode(Mode::Normal, false, window, cx)
+                vim.switch_mode(vim.default_mode(cx), false, window, cx)
             });
 
             Vim::action(editor, cx, |vim, _: &SwitchToInsertMode, window, cx| {
@@ -471,7 +477,9 @@ impl Vim {
                     vim.switch_mode(Mode::HelixNormal, false, window, cx)
                 },
             );
-
+            Vim::action(editor, cx, |_, _: &PushForcedMotion, _, cx| {
+                Vim::globals(cx).forced_motion = true;
+            });
             Vim::action(editor, cx, |vim, action: &PushObject, window, cx| {
                 vim.push_operator(
                     Operator::Object {
@@ -620,6 +628,14 @@ impl Vim {
                 vim.push_operator(Operator::OppositeCase, window, cx)
             });
 
+            Vim::action(editor, cx, |vim, _: &PushRot13, window, cx| {
+                vim.push_operator(Operator::Rot13, window, cx)
+            });
+
+            Vim::action(editor, cx, |vim, _: &PushRot47, window, cx| {
+                vim.push_operator(Operator::Rot47, window, cx)
+            });
+
             Vim::action(editor, cx, |vim, _: &PushRegister, window, cx| {
                 vim.push_operator(Operator::Register, window, cx)
             });
@@ -730,6 +746,10 @@ impl Vim {
         cx.on_release(|_, _| drop(subscription)).detach();
     }
 
+    pub fn default_mode(&self, cx: &App) -> Mode {
+        VimSettings::get_global(cx).default_mode
+    }
+
     pub fn editor(&self) -> Option<Entity<Editor>> {
         self.editor.upgrade()
     }
@@ -768,6 +788,9 @@ impl Vim {
         if let Some(action) = keystroke_event.action.as_ref() {
             // Keystroke is handled by the vim system, so continue forward
             if action.name().starts_with("vim::") {
+                self.update_editor(window, cx, |_, editor, _, _| {
+                    editor.hide_mouse_cursor(&HideMouseCursorOrigin::MovementAction)
+                });
                 return;
             }
         } else if window.has_pending_keystrokes() || keystroke_event.keystroke.is_ime_in_progress()
@@ -823,6 +846,19 @@ impl Vim {
             EditorEvent::Edited { .. } => self.push_to_change_list(window, cx),
             EditorEvent::FocusedIn => self.sync_vim_settings(window, cx),
             EditorEvent::CursorShapeChanged => self.cursor_shape_changed(window, cx),
+            EditorEvent::PushedToNavHistory {
+                anchor,
+                is_deactivate,
+            } => {
+                self.update_editor(window, cx, |vim, editor, window, cx| {
+                    let mark = if *is_deactivate {
+                        "\"".to_string()
+                    } else {
+                        "'".to_string()
+                    };
+                    vim.set_mark(mark, vec![*anchor], editor.buffer(), window, cx);
+                });
+            }
             _ => {}
         }
     }
@@ -839,6 +875,7 @@ impl Vim {
             Operator::AddSurrounds { .. }
                 | Operator::ChangeSurrounds { .. }
                 | Operator::DeleteSurrounds
+                | Operator::Exchange
         ) {
             self.operator_stack.clear();
         };
@@ -877,6 +914,7 @@ impl Vim {
             self.current_tx.take();
             self.current_anchor.take();
         }
+        Vim::take_forced_motion(cx);
         if mode != Mode::Insert && mode != Mode::Replace {
             Vim::take_count(cx);
         }
@@ -981,6 +1019,13 @@ impl Vim {
         count
     }
 
+    pub fn take_forced_motion(cx: &mut App) -> bool {
+        let global_state = cx.global_mut::<VimGlobals>();
+        let forced_motion = global_state.forced_motion;
+        global_state.forced_motion = false;
+        forced_motion
+    }
+
     pub fn cursor_shape(&self, cx: &mut App) -> CursorShape {
         match self.mode {
             Mode::Normal => {
@@ -1080,7 +1125,7 @@ impl Vim {
             }
         }
 
-        if mode == "normal" || mode == "visual" || mode == "operator" {
+        if mode == "normal" || mode == "visual" || mode == "operator" || mode == "helix_normal" {
             context.add("VimControl");
         }
         context.set("vim_mode", mode);
@@ -1097,7 +1142,7 @@ impl Vim {
         let editor = editor.read(cx);
         let editor_mode = editor.mode();
 
-        if editor_mode == EditorMode::Full
+        if editor_mode.is_full()
                 && !newest_selection_empty
                 && self.mode == Mode::Normal
                 // When following someone, don't switch vim mode.
@@ -1342,6 +1387,7 @@ impl Vim {
 
     fn clear_operator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         Vim::take_count(cx);
+        Vim::take_forced_motion(cx);
         self.selected_register.take();
         self.operator_stack.clear();
         self.sync_vim_settings(window, cx);
@@ -1573,7 +1619,7 @@ impl Vim {
                 }
                 _ => self.clear_operator(window, cx),
             },
-            Some(Operator::Mark) => self.create_mark(text, false, window, cx),
+            Some(Operator::Mark) => self.create_mark(text, window, cx),
             Some(Operator::RecordRegister) => {
                 self.record_register(text.chars().next().unwrap(), window, cx)
             }
@@ -1601,7 +1647,7 @@ impl Vim {
                     self.select_register(text, window, cx);
                 }
             },
-            Some(Operator::Jump { line }) => self.jump(text, line, window, cx),
+            Some(Operator::Jump { line }) => self.jump(text, line, true, window, cx),
             _ => {
                 if self.mode == Mode::Replace {
                     self.multi_replace(text, window, cx)

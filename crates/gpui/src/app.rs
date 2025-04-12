@@ -1,21 +1,21 @@
 use std::{
-    any::{type_name, TypeId},
+    any::{TypeId, type_name},
     cell::{Ref, RefCell, RefMut},
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
-    sync::{atomic::Ordering::SeqCst, Arc},
+    sync::{Arc, atomic::Ordering::SeqCst},
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{
+    Future, FutureExt,
     channel::oneshot,
     future::{LocalBoxFuture, Shared},
-    Future, FutureExt,
 };
 use parking_lot::RwLock;
 use slotmap::SlotMap;
@@ -25,19 +25,20 @@ use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 use http_client::HttpClient;
+use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
 use util::ResultExt;
 
 use crate::{
-    current_platform, hash, init_app_menus, Action, ActionBuildError, ActionRegistry, Any, AnyView,
-    AnyWindowHandle, AppContext, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    KeyBinding, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels,
-    Platform, PlatformDisplay, Point, PromptBuilder, PromptHandle, PromptLevel, Render,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, Task, TextSystem, Window, WindowAppearance, WindowHandle, WindowId,
-    WindowInvalidator,
+    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Asset,
+    AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, DispatchPhase, DisplayId,
+    EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, Keymap, Keystroke,
+    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    Point, PromptBuilder, PromptHandle, PromptLevel, Render, RenderablePromptHandle, Reservation,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextSystem,
+    Window, WindowAppearance, WindowHandle, WindowId, WindowInvalidator, current_platform, hash,
+    init_app_menus,
 };
 
 mod async_context;
@@ -650,6 +651,11 @@ impl App {
         self.platform.primary_display()
     }
 
+    /// Returns whether `screen_capture_sources` may work.
+    pub fn is_screen_capture_supported(&self) -> bool {
+        self.platform.is_screen_capture_supported()
+    }
+
     /// Returns a list of available screen capture sources.
     pub fn screen_capture_sources(
         &self,
@@ -1046,15 +1052,17 @@ impl App {
         &self.foreground_executor
     }
 
-    /// Spawns the future returned by the given function on the thread pool. The closure will be invoked
+    /// Spawns the future returned by the given function on the main thread. The closure will be invoked
     /// with [AsyncApp], which allows the application state to be accessed across await points.
     #[track_caller]
-    pub fn spawn<Fut, R>(&self, f: impl FnOnce(AsyncApp) -> Fut) -> Task<R>
+    pub fn spawn<AsyncFn, R>(&self, f: AsyncFn) -> Task<R>
     where
-        Fut: Future<Output = R> + 'static,
+        AsyncFn: AsyncFnOnce(&mut AsyncApp) -> R + 'static,
         R: 'static,
     {
-        self.foreground_executor.spawn(f(self.to_async()))
+        let mut cx = self.to_async();
+        self.foreground_executor
+            .spawn(async move { f(&mut cx).await })
     }
 
     /// Schedules the given function to be run at the end of the current effect cycle, allowing entities
@@ -1345,7 +1353,7 @@ impl App {
     /// Get all non-internal actions that have been registered, along with their schemas.
     pub fn action_schemas(
         &self,
-        generator: &mut schemars::gen::SchemaGenerator,
+        generator: &mut schemars::r#gen::SchemaGenerator,
     ) -> Vec<(SharedString, Option<schemars::schema::Schema>)> {
         self.actions.action_schemas(generator)
     }
@@ -1423,7 +1431,7 @@ impl App {
 
     /// Sets the right click menu for the app icon in the dock
     pub fn set_dock_menu(&self, menus: Vec<MenuItem>) {
-        self.platform.set_dock_menu(menus, &self.keymap.borrow());
+        self.platform.set_dock_menu(menus, &self.keymap.borrow())
     }
 
     /// Performs the action associated with the given dock menu item, only used on Windows for now.
@@ -1437,6 +1445,16 @@ impl App {
     /// If the path is already in the list, it will be moved to the bottom of the list.
     pub fn add_recent_document(&self, path: &Path) {
         self.platform.add_recent_document(path);
+    }
+
+    /// Updates the jump list with the updated list of recent paths for the application, only used on Windows for now.
+    /// Note that this also sets the dock menu on Windows.
+    pub fn update_jump_list(
+        &self,
+        menus: Vec<MenuItem>,
+        entries: Vec<SmallVec<[PathBuf; 2]>>,
+    ) -> Vec<SmallVec<[PathBuf; 2]>> {
+        self.platform.update_jump_list(menus, entries)
     }
 
     /// Dispatch an action to the currently active window or global action handler
@@ -1511,17 +1529,22 @@ impl App {
     pub fn set_prompt_builder(
         &mut self,
         renderer: impl Fn(
-                PromptLevel,
-                &str,
-                Option<&str>,
-                &[&str],
-                PromptHandle,
-                &mut Window,
-                &mut App,
-            ) -> RenderablePromptHandle
-            + 'static,
+            PromptLevel,
+            &str,
+            Option<&str>,
+            &[&str],
+            PromptHandle,
+            &mut Window,
+            &mut App,
+        ) -> RenderablePromptHandle
+        + 'static,
     ) {
         self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)))
+    }
+
+    /// Reset the prompt builder to the default implementation.
+    pub fn reset_prompt_builder(&mut self) {
+        self.prompt_builder = Some(PromptBuilder::Default);
     }
 
     /// Remove an asset from GPUI's cache
@@ -1583,10 +1606,10 @@ impl App {
             .insert(entity_id, window_invalidators);
     }
 
-    /// Get the name for this App.
+    /// Returns the name for this [`App`].
     #[cfg(any(test, feature = "test-support", debug_assertions))]
-    pub fn get_name(&self) -> &'static str {
-        self.name.as_ref().unwrap()
+    pub fn get_name(&self) -> Option<&'static str> {
+        self.name
     }
 
     /// Returns `true` if the platform file picker supports selecting a mix of files and directories.
@@ -1598,13 +1621,11 @@ impl App {
 impl AppContext for App {
     type Result<T> = T;
 
-    /// Build an entity that is owned by the application. The given function will be invoked with
-    /// a `Context` and must return an object representing the entity. A `Entity` handle will be returned,
-    /// which can be used to access the entity in a context.
-    fn new<T: 'static>(
-        &mut self,
-        build_entity: impl FnOnce(&mut Context<'_, T>) -> T,
-    ) -> Entity<T> {
+    /// Builds an entity that is owned by the application.
+    ///
+    /// The given function will be invoked with a [`Context`] and must return an object representing the entity. An
+    /// [`Entity`] handle will be returned, which can be used to access the entity in a context.
+    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         self.update(|cx| {
             let slot = cx.entities.reserve();
             let handle = slot.clone();
@@ -1628,7 +1649,7 @@ impl AppContext for App {
     fn insert_entity<T: 'static>(
         &mut self,
         reservation: Reservation<T>,
-        build_entity: impl FnOnce(&mut Context<'_, T>) -> T,
+        build_entity: impl FnOnce(&mut Context<T>) -> T,
     ) -> Self::Result<Entity<T>> {
         self.update(|cx| {
             let slot = reservation.0;
@@ -1642,7 +1663,7 @@ impl AppContext for App {
     fn update_entity<T: 'static, R>(
         &mut self,
         handle: &Entity<T>,
-        update: impl FnOnce(&mut T, &mut Context<'_, T>) -> R,
+        update: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> R {
         self.update(|cx| {
             let mut entity = cx.entities.lease(handle);
@@ -1793,6 +1814,9 @@ pub struct AnyDrag {
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
     pub cursor_offset: Point<Pixels>,
+
+    /// The cursor style to use while dragging
+    pub cursor_style: Option<CursorStyle>,
 }
 
 /// Contains state associated with a tooltip. You'll only need this struct if you're implementing
